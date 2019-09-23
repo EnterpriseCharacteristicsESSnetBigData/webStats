@@ -1,0 +1,295 @@
+# webStats
+
+Repository for Webscraping Enterprise Characteristics using R.
+Covers the following steps:
+
+1. Search URLs using a R-wrapper for the JAVA program in https://github.com/SummaIstat/UrlSearcher
+2. Validate URLs using unique enterprise identifiers, like VAT or commercial register number (CRN)
+3. Extract Social Media Links from correctly identified URLs.
+
+
+## Search URLs
+
+URLs can be searched through BING using the JAVA program from ISTAT. 
+At first the inputs for the JAVA program must be generated.
+The necessary inputs for the JAVA program need a file with search strings and one with IDs.
+
+#### Source files & and libraries
+```r
+library(data.table)
+# source R-files - not needed if package is ready
+sapply(list.files("~/webStats/R",full.names = TRUE),source,.GlobalEnv)
+```
+
+#### Dummy data
+```{r}
+load("~/webStats/data/dummyEnterprise.RData")
+```
+
+#### Define parameters for creating the inputs 
+```{r,eval=FALSE}
+# column holding the ID
+id <- "ID"
+
+# columns which will define the search string
+searchCols <- c("NAME","ADRESS","STREET")
+
+# name of files which are saved
+fileNameID <- "ID.txt"
+fileNameInput <- "input.txt"
+
+# output path
+path <- getwd()
+
+makeInputURLSearcher(dat=dat,id=id,
+                     searchCols=searchCols,
+                     path=path,
+                     fileNameID = fileNameID,
+                     fileNameInput = fileNameInput)
+```
+
+Inputs contain of two .txt-files, one contains IDs the other the search string
+```{r}
+# IDs
+readLines(file.path(path,"ID.txt"))
+```
+```{r}
+# search string
+readLines(file.path(path,"input.txt"))
+```
+
+#### Run the JAVA program 
+
+The JAVA program is executed through a terminal command under the hood
+
+```{r,eval=FALSE}
+IDInput <- file.path(path,"ID.txt")
+SearchInput <- file.path(path,"input.txt")
+outputFolder <- file.path(path,"output")
+
+searchURL(IDInput,SearchInput,
+          outputFolder=file.path(path,"output"),
+          logFiles=path)
+```
+
+#### Read JAVA output
+Finally the output of the JAVA program is read into a single table and checked against blacklisted URLs.
+It is also possible to exclude certain URLs having a specific suffix like `gv.at`
+```{r,eval=FALSE}
+# define blacklisted URLs
+excludeURLs <- c("facebook","amazon")
+
+# exclude suffix
+excludeSuffix <- "gv.at"
+
+# output path of URL searcher
+pathSearchRes <- file.path(path,"output")
+
+# read in results
+URLs <- prepOutputURLSearcher(pathSearchRes,
+                      IDName="KZ_Z",
+                      excludeURLs=excludeURLs,
+                      excludeSuffix=excludeSuffix)
+# save results
+fwrite(URLs,file=file.path(path,"URLsTest.csv"))
+```
+
+
+## Scrape URLs
+The URLs generated from the JAVA program are scrapped using `RSelenium`.
+The output from the JAVA program is read in and a remote driver is initialized.
+This needs to be done on one of the webscraping servers!
+```{r,eval=FALSE}
+# read in results
+URLs <- fread(file.path(path,"URLsTest.csv"))
+```
+
+#### Initialize remote driver 
+```{r,eval=FALSE}
+library(wdman)
+library(RSelenium)
+library(robotstxt)
+
+port <- 4862L
+cDrv <- chrome(  port = port, version = "74.0.3729.6")
+eCaps <- list(chromeOptions = list(
+  args = c('--headless', '--disable-gpu',
+           '--lang=de' , # set the language
+           '--blink-settings=imagesEnabled=false', 
+           '--window-size=1080,1920', 
+           '--disable-dev-shm-usage',
+           '--user-agent=Mozilla/5.0') # use the user-agent to identify yourself to the admin
+))
+
+remDr <- startBrowser(port,eCaps = eCaps) # <- own helpfunction
+```
+
+#### Run scraper
+Then the URLs are scrapped using the function `scrapeURL()`. Each URL in `dat` is only scrapped once and the results are stored seperately in `outputPath` including a `LookupTable.RDS` so that results can be linked to the original inputs.
+```{r,eval=FALSE}
+outputPath <- file.path(path,"outputScraping")  # where output files are stored
+```
+
+```{r,eval=FALSE}
+# define paramters
+impressumLinks <- c("contact","impressum","kontakt","imprint","legal-notice","legal","notice","disclaimer")
+otherLinks <- NULL # other words in links which must be followed up
+onlyImpressum <- TRUE # scrape only sublinks associated with impressum
+robots <- TRUE # respect robots.txt
+randomDelay <- c(.3,1.5) # randomly wait between .3 and 1.5 seconds
+verbose <- TRUE # print output during scraping
+
+scrapeURL(remDr=remDr,eCaps=eCaps,dat=URLs,urlCol="URL",
+          outputPath=outputPath,
+          impressumLinks=impressumLinks,
+          otherLinks=otherLinks,onlyImpressum=onlyImpressum,
+          robots=robots,
+          randomDelay=randomDelay,verbose=verbose)
+```
+
+After scraping the drivers need to be closed
+```{r,eval=FALSE}
+# close driver 
+remDr$close()
+cDrv$stop()
+```
+
+## Validate URLs
+
+URLs are validated or identified by searching in the scrapped data for
+
+- name and full adress of an enterprise
+- unique identifiers of an enterprise like commercial register number (CRN) or VAT identification number 
+
+
+#### Setup inputs to search for name and full adress
+
+```{r,eval=FALSE}
+matchNames <- getSearchNames(dat,lookupTable = file.path(outputPath,"LookupTable.RDS"),
+                              nameCols=c("NAME","ADRESS","STREET"),
+                              replSpaces=NULL,removeChar=NULL,
+                              IDcol="ID",
+                              fileCol="File")
+matchNames
+```
+
+The entries in **NAME**, **RFS_STRASSE**, **RFS_HNR**, **RFS_PLZ|RFS_ORT** are searched for on each page. Only if alle entries, in arbitrary order, can be found on a single page the enterprise was *identified* on an webpage.
+
+#### Setup inputs to search for unique identifiers
+
+Unique identifiers are extracted using 2 inputs
+
+1. A string which is at the beginning or right bevor the unique identifier
+
+    - for VAT in Austria: "UID" or "VAT" for instance 
+    
+2. The pattern of the identifier itself
+
+    - for VAT in Austria: "AT"+U+8 digits
+
+
+Search inputs for VAT
+```{r}
+load(file.path(owebsc,"countryCodes.RData"))
+
+# atu followed by exactly 8 digits
+# or just 8 digits without a preceeding different country code
+patternVAT <- "(atu[0-9]{8})(?!\\d)"
+patternVATextension <- paste0("(?<!(\\d|",paste0(tolower(countryCodes),collapse="|"),"))[0-9]{8}(?!\\d)")
+patternVAT <- paste(patternVAT,patternVATextension,sep="|")
+
+# if UID, VAT or ATU occurs in text then search the pattern in patternVAT
+# in the following 30 digits (minimum 8 digits)
+checkVAT <- createExtractPattern(c("UID","VAT","ATU"),
+                                 8,30)
+
+checkVAT
+patternVAT
+```
+
+The first input indicates if a unique identifier might be present in the text and the second input (the pattern) is then searched for in the substring of length $k$ starting with the string of the first input. Lets illustrate the procedure with some example data:
+
+```{r}
+# make some dummy text
+text <- list(
+  "Text from main Page",
+  "Text from other page with product ID: 12345678",
+  "Again other text",
+  "Company1 VAT: ATU 11122233. Company2 VAT: 99988877",
+  "Here is something else VAT 4445556667")
+```
+
+The `text` contains only correct VATs at position 4. Position 2 has a product ID with 8 digits and position 5 the "VAT" which should indicate a VAT identification number but it is followed by 9 digits thus it cannot be the identifier which we are looking for. The low-level function `extractID_work()` is applied for this procedure and yields the following:
+
+```{r}
+lapply(text,function(t){
+  # low level function
+  extractID_work(checkForID=checkVAT,
+               patternForID=patternVAT,
+               text=t)})
+```
+
+Thus the VATs at position 4 are successfully extracted and all other text is ignored.
+The same procedure is applied for other identifiers like the CRN.
+
+```{r}
+# commercial register number
+patternFN <- "(?<!(\\d))([0-9]{5,6}[a-z]{1})"
+checkFN <- createExtractPattern(c("FN","Firmenbuch","Handelsregister","Commercialregister"),
+                                6,c(10,30,30,30))
+
+# GLN
+patternGLN <- "(?<!(\\d))([0-9]{13})(?!\\d)"
+checkGLN <- createExtractPattern("GLN",13,50)
+```
+
+#### Run `validateURL()`
+
+The function `validateURL()` is a wrapper which extracts identifiers and searches for enterprise names for various scraped text with a single function call
+```{r,eval=FALSE}
+checkID <- list(VAT=checkVAT,CRN=checkFN,GLN=checkGLN)
+patternID <- list(VAT=patternVAT,CRN=patternFN,GLN=patternGLN)
+
+outputValidate <- validateURL(outputPath,fileNames="WebData",tag="body",
+                              checkID=checkID,patternID=patternID,
+                              matchNames=matchNames,IDcol="KZ_Z",verbose=TRUE)
+outputValidate
+```
+
+
+## Retrieve characteristics
+
+Besides identifying the owner of a URL we also want to extract certain attributes, like
+
+- Existance of links to social media sites like facebook, twitter, instagramm
+- Existance of online shop
+- Job vacancies on url
+
+#### Social Media Links
+
+With the function `getSocialMedia()` one can extract social media links from the scrapped data of various URLs. The inputs are to some extend similar to `validateURL()`.
+
+
+```{r,eval=FALSE}
+# social media domains
+domain <- c("facebook","linkedin","twitter","plus.google","youtube","instagram")
+# drop certain links like https://de-de.facebook.com/policies
+# which just link to general guidlines and not to social media accounts
+dropLink <- c("share","policy","plugins","privacy","settings","policies",
+                    "cookies","blocker","terms","help","about","ads",
+                    "preferences","username","event","hashtag","developer")
+
+outputSocialMedia <- getSocialMedia(files=outputPath,fileNames="WebData",
+                                    tag="body",tagLinks=c("a","base","link","area"),
+                                    domain=domain,dropLink=dropLink,
+                                    verbose=TRUE)
+```
+
+
+
+
+
+
+
+
+
